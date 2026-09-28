@@ -1,0 +1,15 @@
+# Shared Finance Domain Core Verification
+
+Date: 2026-09-28
+
+Focused command: `uv run pytest tests/test_domain_core.py tests/test_domain_ledger.py tests/test_query_transactions.py tests/test_income.py -q`
+Exit code: 0
+Summary: `10 passed, 1 warning`
+
+Full command: `uv run pytest tests/ -q`
+Exit code: 0
+Summary: `243 passed, 2 warnings`
+
+The new repository seam uses caller-owned sessions, preserves existing
+SQLModel tables and source-message IDs, projects both ledger directions, and
+filters results by the requested user before returning the shared projection.

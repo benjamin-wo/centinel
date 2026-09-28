@@ -1,0 +1,792 @@
+from typing import Protocol, List, Dict, Any, Optional
+import asyncio
+import base64
+import email
+import html
+import httpx
+import imaplib
+import re
+from datetime import datetime, timedelta, timezone as dt_timezone
+from email.utils import parsedate_to_datetime
+from email.header import decode_header, make_header
+from zoneinfo import ZoneInfo
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
+from core.models import UserProfile, UserCredential
+from core.db import async_session_factory
+from core.config import settings
+from core.vault import decrypt_token
+from core.shared_tools.email_presets import build_gmail_query, build_outlook_query
+
+
+def _decode_mime(value: Any) -> str:
+    """Decode RFC2047-encoded MIME headers into plain text."""
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value)))
+    except Exception:
+        return str(value)
+
+
+def _body_snippet(message: email.message.Message, limit: int = 220) -> str:
+    """Extract a plain-text preview from a parsed email message."""
+    if message.is_multipart():
+        for part in message.walk():
+            if part.get_content_type() == "text/plain" and part.get_payload(decode=True):
+                try:
+                    text = part.get_payload(decode=True).decode(
+                        part.get_content_charset() or "utf-8", errors="replace"
+                    )
+                except Exception:
+                    continue
+                return " ".join(text.split())[:limit]
+    payload = message.get_payload(decode=True)
+    if payload:
+        try:
+            text = payload.decode(message.get_content_charset() or "utf-8", errors="replace")
+        except Exception:
+            return ""
+        return " ".join(text.split())[:limit]
+    return ""
+
+
+def _extract_body_text(message: email.message.Message) -> str:
+    """Extract the full plain-text body from a parsed email message (no truncation)."""
+    if message.is_multipart():
+        for part in message.walk():
+            if part.get_content_type() == "text/plain" and part.get_payload(decode=True):
+                try:
+                    text = part.get_payload(decode=True).decode(
+                        part.get_content_charset() or "utf-8", errors="replace"
+                    )
+                except Exception:
+                    continue
+                return text.strip()
+    payload = message.get_payload(decode=True)
+    if payload:
+        try:
+            text = payload.decode(message.get_content_charset() or "utf-8", errors="replace")
+        except Exception:
+            return ""
+        return text.strip()
+    return ""
+
+
+def _fetch_outlook_imap(
+    tracked_banks: List[str],
+    custom_query: Optional[str] = None,
+    latest: bool = False,
+    exclude_domains: Optional[List[str]] = None,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch recent messages from a Microsoft personal mailbox via IMAP
+    (app password). Returns [] when the mailbox is unreachable.
+    """
+    user = settings.outlook_email
+    password = settings.outlook_app_password
+    if not user or not password:
+        return []
+
+    since = (datetime.now(ZoneInfo("UTC")) - timedelta(days=7)).strftime("%d-%b-%Y")
+    conn: Optional[imaplib.IMAP4_SSL] = None
+    try:
+        conn = imaplib.IMAP4_SSL("outlook.office365.com", 993, timeout=30)
+        conn.login(user, password)
+        conn.select("INBOX", readonly=True)
+        # Informational "latest email" lookups skip the rolling window so the
+        # true newest messages are returned regardless of age.
+        criteria = ("ALL",) if latest else ("SINCE", since)
+        status, data = conn.search(None, *criteria)
+        # A large mailbox returns the UID list split over multiple IMAP lines;
+        # data[0] alone would silently truncate it to the oldest messages.
+        uids: List[bytes] = []
+        if status == "OK" and data:
+            for chunk in data:
+                if chunk:
+                    uids.extend(chunk.split())
+        uids = uids[-limit:] if uids else []
+
+        messages: List[Dict[str, Any]] = []
+        for uid in uids:
+            fstatus, fdata = conn.uid("FETCH", uid, "(BODY.PEEK[])")
+            if fstatus != "OK" or not fdata or not isinstance(fdata[0], tuple):
+                continue
+            msg = email.message_from_bytes(fdata[0][1])
+            sender = _decode_mime(msg.get("From"))
+            subject = _decode_mime(msg.get("Subject"))
+            body = _body_snippet(msg)
+            full_body_text = _extract_body_text(msg)[:12000]
+            date = _decode_mime(msg.get("Date"))
+
+            sender_domain = sender.split("@")[-1].strip().lower() if "@" in sender else ""
+            query_lower = (custom_query or "").lower()
+            matches_custom = (
+                not query_lower
+                or query_lower in (subject + " " + body + " " + sender).lower()
+            )
+            matches_bank = (
+                not tracked_banks
+                or any(domain in sender_domain for domain in tracked_banks)
+            )
+            matches_exclude = (
+                not exclude_domains
+                or not any(domain in sender_domain for domain in exclude_domains)
+            )
+            if not latest and (not matches_custom or not matches_bank or not matches_exclude):
+                continue
+
+            raw_date = _decode_mime(msg.get("Date"))
+            date_iso = ""
+            if raw_date:
+                try:
+                    date_iso = parsedate_to_datetime(raw_date).isoformat()
+                except Exception:
+                    date_iso = raw_date
+            if not date_iso:
+                date_iso = datetime.now(dt_timezone.utc).isoformat()
+
+            messages.append(
+                {
+                    "id": str(uid, "utf-8", errors="replace"),
+                    "provider": "outlook",
+                    "subject": subject or "(no subject)",
+                    "sender": sender,
+                    "body": full_body_text,
+                    "snippet": body or "(no text body)",
+                    "date": date_iso,
+                    "query_used": custom_query or f"recent since {since}",
+                }
+            )
+        return messages
+    except Exception as exc:  # noqa: BLE001 - never crash the webhook on mailbox errors
+        print(f"[OUTLOOK IMAP] error: {type(exc).__name__}: {exc}")
+        return []
+    finally:
+        if conn:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+
+def _extract_gmail_body(payload: Dict[str, Any], limit: int = 12000) -> str:
+    """Extract plain text or cleanly stripped HTML body from Gmail message payload.
+
+    12000-char input limit (~3000 tokens) fits comfortably within the Jev 32K-token
+    and chat-model context windows while preventing abuse.
+    """
+    if not payload:
+        return ""
+
+    def _decode_b64(data: str) -> str:
+        try:
+            padded = data + "=" * (-len(data) % 4)
+            return base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    plain_parts: List[str] = []
+    html_parts: List[str] = []
+
+    def _walk_parts(parts: List[Dict[str, Any]]):
+        for part in parts:
+            mime = (part.get("mimeType") or "").lower()
+            data = part.get("body", {}).get("data")
+            if mime.startswith("text/plain") and data:
+                plain_parts.append(_decode_b64(data))
+            elif mime.startswith("text/html") and data:
+                html_parts.append(_decode_b64(data))
+            if "parts" in part and isinstance(part["parts"], list):
+                _walk_parts(part["parts"])
+
+    if "parts" in payload and isinstance(payload["parts"], list):
+        _walk_parts(payload["parts"])
+    elif payload.get("body", {}).get("data"):
+        mime = (payload.get("mimeType") or "").lower()
+        data = payload["body"]["data"]
+        if mime.startswith("text/html"):
+            html_parts.append(_decode_b64(data))
+        else:
+            plain_parts.append(_decode_b64(data))
+
+    if plain_parts:
+        full_plain = "\n".join(plain_parts)
+        return " ".join(full_plain.split())[:limit]
+
+    if html_parts:
+        full_html = "\n".join(html_parts)
+        clean = re.sub(r"<style[^>]*>.*?</style>", " ", full_html, flags=re.DOTALL | re.IGNORECASE)
+        clean = re.sub(r"<script[^>]*>.*?</script>", " ", clean, flags=re.DOTALL | re.IGNORECASE)
+        clean = re.sub(r"<[^>]+>", " ", clean)
+        clean = html.unescape(clean)
+        return " ".join(clean.split())[:limit]
+
+    return ""
+
+
+class EmailProvider(Protocol):
+    """Protocol for email service providers (Gmail, Outlook, etc.)."""
+    async def search_messages(
+        self,
+        user_id: int,
+        tracked_banks: List[str],
+        custom_query: Optional[str] = None,
+        latest: bool = False,
+        exclude_domains: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        ...
+
+    async def apply_processed_label(self, user_id: int, message_id: str) -> bool:
+        ...
+
+    async def get_message_by_id(self, user_id: int, message_id: str) -> Optional[Dict[str, Any]]:
+        ...
+
+class GmailProvider:
+    """Gmail backend implementation using Google OAuth and Lucene-style search queries."""
+    async def search_messages(
+        self,
+        user_id: int,
+        tracked_banks: List[str],
+        custom_query: Optional[str] = None,
+        latest: bool = False,
+        exclude_domains: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        if settings.google_client_id:
+            return await self._search_real_gmail(user_id, tracked_banks, custom_query, latest, exclude_domains)
+
+        query = build_gmail_query(tracked_banks=tracked_banks, custom_query=custom_query, exclude_domains=exclude_domains)
+        # No OAuth client configured (local tests/dev): structured mock for pipeline tests.
+        return [
+            {
+                "id": "msg_1001",
+                "provider": "gmail",
+                "subject": "Your receipt from Starbucks",
+                "sender": "receipts@starbucks.com",
+                "body": "",
+                "snippet": "Thank you for your order. Total paid: $15.00 on 2026-08-01.",
+                "date": "2026-08-01T10:00:00Z",
+                "query_used": query,
+            }
+        ]
+
+    async def _search_real_gmail(
+        self,
+        user_id: int,
+        tracked_banks: List[str],
+        custom_query: Optional[str] = None,
+        latest: bool = False,
+        exclude_domains: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetch real messages from the Gmail API using the stored OAuth refresh token."""
+        refresh_token = await _get_gmail_refresh_token(user_id)
+        if not refresh_token:
+            print(f"[GMAIL] no refresh token for user {user_id} — connect at /auth/gmail")
+            return []
+
+        # Informational "latest email" lookups fetch the newest messages with no
+        # financial keyword filter; the Gmail API returns newest-first by default.
+        query = "" if latest else build_gmail_query(tracked_banks=tracked_banks, custom_query=custom_query, exclude_domains=exclude_domains)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            access_token = await _refresh_gmail_access_token(client, refresh_token)
+            if not access_token:
+                return []
+
+            headers = {"Authorization": f"Bearer {access_token}"}
+
+            # Retry once on transient network timeouts
+            list_resp = None
+            for attempt in range(2):
+                try:
+                    list_resp = await client.get(
+                        "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+                        params={"q": query, "maxResults": 10},
+                        headers=headers,
+                    )
+                    if list_resp.status_code == 200:
+                        break
+                except (httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
+                    if attempt == 0:
+                        print(
+                            f"[GMAIL] list {type(exc).__name__} "
+                            f"(attempt 1/2), retrying in 5s..."
+                        )
+                        await asyncio.sleep(5)
+                        continue
+                    print(f"[GMAIL] list failed after retry: {type(exc).__name__}")
+                    return []
+
+            if list_resp is None or list_resp.status_code != 200:
+                print(
+                    f"[GMAIL] list failed: "
+                    f"{list_resp.status_code if list_resp else 'unknown'} "
+                    f"{list_resp.text[:200] if list_resp else ''}"
+                )
+                return []
+
+            messages = []
+            for item in (list_resp.json().get("messages") or [])[:10]:
+                meta_resp = await client.get(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{item['id']}",
+                    params={"format": "full"},
+                    headers=headers,
+                )
+                if meta_resp.status_code != 200:
+                    continue
+                meta = meta_resp.json()
+                payload = meta.get("payload", {})
+                header_map = {
+                    (h.get("name") or "").lower(): h.get("value", "")
+                    for h in payload.get("headers", [])
+                }
+                raw_date = header_map.get("date", "")
+                internal_ms = meta.get("internalDate")
+                # internalDate is the authoritative UTC receive time; the Date
+                # header can be spoofed or wrong (forwards, marketing mail).
+                date_iso = ""
+                if internal_ms:
+                    try:
+                        date_iso = datetime.fromtimestamp(int(internal_ms) / 1000.0, tz=dt_timezone.utc).isoformat()
+                    except Exception:
+                        pass
+                if not date_iso and raw_date:
+                    try:
+                        date_iso = parsedate_to_datetime(raw_date).isoformat()
+                    except Exception:
+                        pass
+                if not date_iso:
+                    date_iso = datetime.now(dt_timezone.utc).isoformat()
+
+                # Extract the real full message text from MIME payload
+                full_body = _extract_gmail_body(payload, limit=12000)
+                snippet_text = full_body or meta.get("snippet", "")
+
+                messages.append(
+                    {
+                        "id": item["id"],
+                        "provider": "gmail",
+                        "subject": header_map.get("subject") or "(no subject)",
+                        "sender": header_map.get("from", ""),
+                        "body": full_body,
+                        "snippet": snippet_text,
+                        "date": date_iso,
+                        "query_used": query,
+                    }
+                )
+            return messages
+
+    async def apply_processed_label(self, user_id: int, message_id: str) -> bool:
+        """Apply the Assistant/Processed label via the Gmail API (requires gmail.modify)."""
+        # Non-fatal by design: every code path (403, timeout, network error) is caught
+        # by the outer try/except and returns False — the sweep never aborts for a
+        # label operation.
+        refresh_token = await _get_gmail_refresh_token(user_id)
+        if not refresh_token:
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                access_token = await _refresh_gmail_access_token(client, refresh_token)
+                if not access_token:
+                    return False
+                headers = {"Authorization": f"Bearer {access_token}"}
+
+                labels_resp = await client.get(
+                    "https://gmail.googleapis.com/gmail/v1/users/me/labels",
+                    headers=headers,
+                )
+                if labels_resp.status_code != 200:
+                    print(f"[GMAIL] labels list failed: {labels_resp.status_code}")
+                    return False
+                label_id = next(
+                    (
+                        label["id"]
+                        for label in labels_resp.json().get("labels", [])
+                        if label.get("name") == "Assistant/Processed"
+                    ),
+                    None,
+                )
+                if not label_id:
+                    create_resp = await client.post(
+                        "https://gmail.googleapis.com/gmail/v1/users/me/labels",
+                        json={
+                            "name": "Assistant/Processed",
+                            "messageListVisibility": "show",
+                            "labelListVisibility": "labelShow",
+                        },
+                        headers=headers,
+                    )
+                    if create_resp.status_code not in (200, 201):
+                        if create_resp.status_code == 403:
+                            print(
+                                "[GMAIL] label create failed: 403 — the stored "
+                                "OAuth token lacks gmail.modify scope. Reconnect "
+                                "at /auth/gmail to re-consent."
+                            )
+                        else:
+                            print(f"[GMAIL] label create failed: {create_resp.status_code}")
+                        return False
+                    label_id = create_resp.json().get("id")
+
+                modify_resp = await client.post(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}/modify",
+                    json={"addLabelIds": [label_id]},
+                    headers=headers,
+                )
+                if modify_resp.status_code != 200:
+                    print(
+                        f"[GMAIL] label apply failed: {modify_resp.status_code} "
+                        f"{modify_resp.text[:200]}"
+                    )
+                    return False
+                return True
+        except Exception as exc:  # noqa: BLE001
+            print(f"[GMAIL] label apply error: {exc}")
+            return False
+
+    async def get_message_by_id(self, user_id: int, message_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single Gmail message by ID and return subject/sender/snippet/date."""
+        refresh_token = await _get_gmail_refresh_token(user_id)
+        if not refresh_token:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                access_token = await _refresh_gmail_access_token(client, refresh_token)
+                if not access_token:
+                    return None
+                headers = {"Authorization": f"Bearer {access_token}"}
+                resp = await client.get(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
+                    params={"format": "metadata", "metadataHeaders": ["Subject", "From", "Date"]},
+                    headers=headers,
+                )
+                if resp.status_code != 200:
+                    print(f"[GMAIL] get_message_by_id failed: {resp.status_code} {resp.text[:200]}")
+                    return None
+                data = resp.json()
+                payload = data.get("payload", {})
+                header_map = {
+                    (h.get("name") or "").lower(): h.get("value", "")
+                    for h in payload.get("headers", [])
+                }
+                return {
+                    "id": message_id,
+                    "subject": header_map.get("subject") or "(no subject)",
+                    "sender": header_map.get("from", ""),
+                    "snippet": data.get("snippet", ""),
+                    "date": header_map.get("date", ""),
+                }
+        except Exception as exc:  # noqa: BLE001
+            print(f"[GMAIL] get_message_by_id error: {exc}")
+            return None
+
+
+async def _get_gmail_refresh_token(user_id: int) -> Optional[str]:
+    """Return the decrypted Gmail refresh token for a user, or None if not connected."""
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(UserCredential).where(
+                UserCredential.user_id == user_id,
+                UserCredential.provider == "gmail",
+            )
+        )
+        cred = result.scalar_one_or_none()
+        if not cred:
+            return None
+        try:
+            return decrypt_token(cred.encrypted_token_payload)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[GMAIL] failed to decrypt stored token: {exc}")
+            return None
+
+
+async def _refresh_gmail_access_token(client: httpx.AsyncClient, refresh_token: str) -> Optional[str]:
+    """Exchange a stored refresh token for a short-lived Gmail access token."""
+    token_resp = await client.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": settings.google_client_id,
+            "client_secret": settings.google_client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        },
+    )
+    token_data = token_resp.json()
+    access_token = token_data.get("access_token")
+    if not access_token:
+        error = token_data.get("error") or ""
+        error_desc = token_data.get("error_description") or ""
+        if "invalid_grant" in error or "invalid_grant" in error_desc:
+            print(
+                "[GMAIL] token expired or revoked — reconnect at /auth/gmail "
+                "to mint a new one"
+            )
+        else:
+            print(f"[GMAIL] token refresh failed: {error_desc or error}")
+        return None
+    return access_token
+
+class OutlookProvider:
+    """Microsoft Outlook backend: per-user OAuth via Microsoft Graph, IMAP app-password fallback."""
+
+    async def search_messages(
+        self,
+        user_id: int,
+        tracked_banks: List[str],
+        custom_query: Optional[str] = None,
+        latest: bool = False,
+        exclude_domains: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        # 1. Per-user OAuth via Microsoft Graph (preferred)
+        refresh_token = await _get_outlook_refresh_token(user_id)
+        if refresh_token:
+            return await self._search_real_outlook(user_id, refresh_token, tracked_banks, custom_query, latest, exclude_domains)
+
+        # 2. Single-mailbox IMAP fallback from environment credentials
+        if settings.outlook_email and settings.outlook_app_password:
+            return await asyncio.to_thread(
+                _fetch_outlook_imap, tracked_banks, custom_query, latest, exclude_domains
+            )
+
+        odata_params = build_outlook_query(tracked_banks=tracked_banks, custom_query=custom_query, exclude_domains=exclude_domains)
+        # No mailbox credentials configured: keep the structured mock for local tests/dev.
+        return [
+            {
+                "id": "msg_outlook_2001",
+                "provider": "outlook",
+                "subject": "Payment receipt from Amazon",
+                "sender": "auto-confirm@amazon.com",
+                "body": "",
+                "snippet": "Your order has been charged. Total paid: $42.50 on 2026-08-01.",
+                "date": "2026-08-01T11:30:00Z",
+                "query_used": odata_params,
+            }
+        ]
+
+    async def _search_real_outlook(
+        self,
+        user_id: int,
+        refresh_token: str,
+        tracked_banks: List[str],
+        custom_query: Optional[str] = None,
+        latest: bool = False,
+        exclude_domains: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetch real messages from Microsoft Graph using the stored OAuth refresh token."""
+        query_params = build_outlook_query(tracked_banks=tracked_banks, custom_query=custom_query, exclude_domains=exclude_domains)
+        since = (datetime.now(dt_timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            access_token = await _refresh_outlook_access_token(client, refresh_token)
+            if not access_token:
+                return []
+
+            headers = {"Authorization": f"Bearer {access_token}"}
+            params = {
+                "$top": "10",
+                "$select": "id,subject,from,body,receivedDateTime,categories",
+            }
+            if latest:
+                # Informational "latest email" lookups: newest messages first,
+                # no financial keywords, no rolling window.
+                params["$orderby"] = "receivedDateTime desc"
+            else:
+                params.update(query_params)
+                # Bound Outlook polling to the same rolling window as Gmail.
+                existing_filter = query_params.get("$filter") or ""
+                received_filter = f"receivedDateTime ge {since}"
+                params["$filter"] = f"{received_filter} and {existing_filter}" if existing_filter else received_filter
+                if "$search" not in query_params:
+                    # Microsoft Graph forbids combining $search with $orderby
+                    params["$orderby"] = "receivedDateTime desc"
+            list_resp = await client.get(
+                "https://graph.microsoft.com/v1.0/me/messages",
+                headers=headers,
+                params=params,
+            )
+            if list_resp.status_code == 401:
+                print("[OUTLOOK] access token rejected — reconnect Outlook at /auth/outlook")
+                return []
+            if list_resp.status_code != 200:
+                print(f"[OUTLOOK] list failed: {list_resp.status_code} {list_resp.text[:200]}")
+                return []
+
+            messages = []
+            for item in (list_resp.json().get("value") or [])[:10]:
+                sender_raw = ((item.get("from") or {}).get("emailAddress") or {})
+                sender = (
+                    f"{sender_raw.get('name', '')} <{sender_raw.get('address', '')}>".strip(" <>")
+                    or sender_raw.get("address", "")
+                )
+                body_content = ((item.get("body") or {}).get("content") or "")
+                body_text = _html_to_text(body_content, limit=12000)
+
+                messages.append(
+                    {
+                        "id": item.get("id", ""),
+                        "provider": "outlook",
+                        "subject": item.get("subject") or "(no subject)",
+                        "sender": sender,
+                        "body": body_text,
+                        "snippet": body_text[:220] or "(no text body)",
+                        "date": item.get("receivedDateTime") or "",
+                        "query_used": query_params.get("$search", ""),
+                    }
+                )
+            return messages
+
+    async def apply_processed_label(self, user_id: int, message_id: str) -> bool:
+        """Add the 'Assistant/Processed' category to a message via Microsoft Graph."""
+        refresh_token = await _get_outlook_refresh_token(user_id)
+        if not refresh_token:
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                access_token = await _refresh_outlook_access_token(client, refresh_token)
+                if not access_token:
+                    return False
+                headers = {"Authorization": f"Bearer {access_token}"}
+
+                msg_resp = await client.get(
+                    f"https://graph.microsoft.com/v1.0/me/messages/{message_id}",
+                    headers=headers,
+                    params={"$select": "categories"},
+                )
+                existing: List[str] = []
+                if msg_resp.status_code == 200:
+                    existing = list(msg_resp.json().get("categories") or [])
+                if "Assistant/Processed" in existing:
+                    return True
+
+                patch_resp = await client.patch(
+                    f"https://graph.microsoft.com/v1.0/me/messages/{message_id}",
+                    headers=headers,
+                    json={"categories": existing + ["Assistant/Processed"]},
+                )
+                if patch_resp.status_code not in (200, 201, 204):
+                    print(f"[OUTLOOK] category patch failed: {patch_resp.status_code}")
+                    return False
+                return True
+        except Exception as exc:  # noqa: BLE001
+            print(f"[OUTLOOK] label apply error: {exc}")
+            return False
+
+    async def get_message_by_id(self, user_id: int, message_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single Outlook message by ID and return subject/sender/snippet/date."""
+        refresh_token = await _get_outlook_refresh_token(user_id)
+        if not refresh_token:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                access_token = await _refresh_outlook_access_token(client, refresh_token)
+                if not access_token:
+                    return None
+                headers = {"Authorization": f"Bearer {access_token}"}
+                resp = await client.get(
+                    f"https://graph.microsoft.com/v1.0/me/messages/{message_id}",
+                    params={"$select": "subject,from,receivedDateTime,bodyPreview"},
+                    headers=headers,
+                )
+                if resp.status_code != 200:
+                    print(f"[OUTLOOK] get_message_by_id failed: {resp.status_code} {resp.text[:200]}")
+                    return None
+                data = resp.json()
+                sender_raw = (data.get("from") or {}).get("emailAddress") or {}
+                sender = (
+                    f"{sender_raw.get('name', '')} <{sender_raw.get('address', '')}>".strip(" <>")
+                    or sender_raw.get("address", "")
+                )
+                return {
+                    "id": message_id,
+                    "subject": data.get("subject") or "(no subject)",
+                    "sender": sender,
+                    "snippet": data.get("bodyPreview") or "",
+                    "date": data.get("receivedDateTime") or "",
+                }
+        except Exception as exc:  # noqa: BLE001
+            print(f"[OUTLOOK] get_message_by_id error: {exc}")
+            return None
+
+
+def _html_to_text(html_body: str, limit: int = 12000) -> str:
+    """Convert an HTML email body to clean plain text (also passes plain text through).
+
+    12000-char input limit (~3000 tokens) fits comfortably within the Jev 32K-token
+    and chat-model context windows while preventing abuse.
+    """
+    if not html_body:
+        return ""
+    if "<" not in html_body:
+        return " ".join(html_body.split())[:limit]
+    clean = re.sub(r"<style[^>]*>.*?</style>", " ", html_body, flags=re.DOTALL | re.IGNORECASE)
+    clean = re.sub(r"<script[^>]*>.*?</script>", " ", clean, flags=re.DOTALL | re.IGNORECASE)
+    clean = re.sub(r"<[^>]+>", " ", clean)
+    clean = html.unescape(clean)
+    return " ".join(clean.split())[:limit]
+
+
+async def _get_outlook_refresh_token(user_id: int) -> Optional[str]:
+    """Return the decrypted Microsoft refresh token for a user, or None if not connected."""
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(UserCredential).where(
+                UserCredential.user_id == user_id,
+                UserCredential.provider == "outlook",
+            )
+        )
+        cred = result.scalar_one_or_none()
+        if not cred:
+            return None
+        try:
+            return decrypt_token(cred.encrypted_token_payload)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[OUTLOOK] failed to decrypt stored token: {exc}")
+            return None
+
+
+async def _refresh_outlook_access_token(client: httpx.AsyncClient, refresh_token: str) -> Optional[str]:
+    """Exchange a stored Microsoft refresh token for a short-lived Graph access token."""
+    tenant = settings.microsoft_tenant or "consumers"
+    token_resp = await client.post(
+        f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+        data={
+            "client_id": settings.microsoft_client_id,
+            "client_secret": settings.microsoft_client_secret or "",
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+            "scope": "offline_access Mail.Read Mail.ReadWrite User.Read",
+        },
+    )
+    token_data = token_resp.json()
+    access_token = token_data.get("access_token")
+    if not access_token:
+        print(
+            f"[OUTLOOK] token refresh failed: "
+            f"{token_data.get('error_description') or token_data.get('error')}"
+        )
+        return None
+    return access_token
+
+PROVIDER_REGISTRY: Dict[str, EmailProvider] = {
+    "gmail": GmailProvider(),
+    "outlook": OutlookProvider(),
+}
+
+async def get_active_providers_for_user(user_id: int) -> List[str]:
+    """
+    Query UserCredential for active email provider registrations.
+    Defaults to ['gmail'] if none are configured to maintain backward compatibility.
+    """
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(UserCredential).where(UserCredential.user_id == user_id)
+        )
+        creds = result.scalars().all()
+        providers = [c.provider.lower() for c in creds if c.provider.lower() in PROVIDER_REGISTRY]
+        if providers:
+            return list(set(providers))
+        # Production fallback: prefer the provider with real credentials configured.
+        if settings.outlook_email and settings.outlook_app_password:
+            return ["outlook"]
+        return ["gmail"]

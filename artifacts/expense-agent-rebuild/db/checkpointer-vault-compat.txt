@@ -1,0 +1,18 @@
+# Checkpointer and Vault Compatibility Verification
+
+Date: 2026-09-28
+
+Resolved package pin: `langgraph-checkpoint-postgres==3.1.2`
+
+Command: `uv run pytest tests/test_vault_checkpoint_compat.py tests/test_vault.py tests/test_checkpointer_guard.py -q`
+Exit code: 0
+Summary: `8 passed, 2 warnings`
+
+The compatibility tests verify that missing `ENCRYPTION_KEY` fails closed,
+configured-key ciphertext round-trips, statement timeouts remain bounded, and
+the local checkpointer recovery path remains available. No key, ciphertext,
+plaintext, checkpoint rows, or production connection details are recorded.
+
+Command: `uv run pytest tests/ -q`
+Exit code: 0
+Summary: `239 passed, 2 warnings`

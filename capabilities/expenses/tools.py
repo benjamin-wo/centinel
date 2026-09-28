@@ -25,6 +25,8 @@ from core.models import (
     UserProfile,
 )
 from core.tool_guard import identity_bound
+from domain.ledger import ExpenseDraft, IncomeDraft
+from domain.ledger_repository import query_unified_ledger, save_expense, save_income
 from capabilities.expenses.schemas import ExtractedExpense
 from capabilities.email.tools import apply_gmail_processed_label, apply_email_processed_tag
 
@@ -503,19 +505,6 @@ async def save_income_transaction(
 ) -> IncomeTransaction:
     """Persist parsed incoming-money fields for one user."""
     async with async_session_factory() as session:
-        profile = (await session.execute(
-            select(UserProfile).where(UserProfile.user_id == user_id)
-        )).scalar_one_or_none()
-        if profile is None:
-            session.add(
-                UserProfile(
-                    user_id=user_id,
-                    telegram_chat_id=user_id,
-                    current_timezone="Asia/Singapore",
-                )
-            )
-            await session.flush()
-
         parsed_date = income.get("date") or income.get("date_iso")
         try:
             income_date = datetime.fromisoformat(str(parsed_date).replace("Z", "+00:00"))
@@ -526,18 +515,20 @@ async def save_income_transaction(
         else:
             income_date = income_date.replace(tzinfo=dt_timezone.utc)
 
-        item = IncomeTransaction(
-            user_id=user_id,
-            amount=round(float(income["amount"]), 2),
-            currency=str(income.get("currency") or "SGD").strip().upper(),
-            source=str(income.get("source") or "Other").strip(),
-            category=normalize_income_category(str(income.get("category") or "Other")),
-            date=income_date,
-            notes=str(income.get("notes") or "").strip() or None,
-            source_message_id=source_message_id,
-            linked_expense_id=income.get("linked_expense_id"),
+        item = await save_income(
+            session,
+            user_id,
+            IncomeDraft(
+                amount=round(float(income["amount"]), 2),
+                currency=str(income.get("currency") or "SGD").strip().upper(),
+                source=str(income.get("source") or "Other").strip(),
+                category=normalize_income_category(str(income.get("category") or "Other")),
+                date=income_date,
+                notes=str(income.get("notes") or "").strip() or None,
+                linked_expense_id=income.get("linked_expense_id"),
+            ),
+            source_message_id,
         )
-        session.add(item)
         await session.commit()
         await session.refresh(item)
         return item
@@ -558,20 +549,22 @@ async def save_expense_transaction(
         exp_date = expense.date
         if exp_date is not None and exp_date.tzinfo is None:
             exp_date = exp_date.replace(tzinfo=dt_timezone.utc)
-        tx = ExpenseTransaction(
-            user_id=user_id,
-            amount=expense.amount,
-            currency=expense.currency,
-            merchant=expense.merchant,
-            category=norm_cat,
-            date=exp_date,
+        tx = await save_expense(
+            session,
+            user_id,
+            ExpenseDraft(
+                amount=expense.amount,
+                currency=expense.currency,
+                merchant=expense.merchant,
+                category=norm_cat,
+                date=exp_date,
+            ),
             source_message_id=source_message_id,
-            source_sender_domain=(source_sender_domain or "").lower() or None,
-            logged_at=logged_at.replace(tzinfo=dt_timezone.utc) if logged_at is not None and logged_at.tzinfo is None else logged_at,
             is_verified=is_verified,
+            source_sender_domain=source_sender_domain,
+            logged_at=logged_at.replace(tzinfo=dt_timezone.utc) if logged_at is not None and logged_at.tzinfo is None else logged_at,
             notes=notes,
         )
-        session.add(tx)
         await session.commit()
         await session.refresh(tx)
         return tx
@@ -1481,113 +1474,43 @@ async def query_unified_transactions(
     Returns structured data: per-direction totals/counts by currency, net cashflow
     per currency, and up to `limit` merged item rows ordered newest-first.
     """
-    from sqlmodel import or_
-
     since_dt = await _parse_ledger_date(since_date)
     until_dt = await _parse_ledger_date(until_date)
-    wanted_directions = {"outgoing", "incoming"} if direction == "all" else {direction}
-    pattern = f"%{search_text}%" if search_text else None
-
-    outgoing_items: List[Dict[str, Any]] = []
-    incoming_items: List[Dict[str, Any]] = []
 
     async with async_session_factory() as session:
-        if "outgoing" in wanted_directions:
-            expense_query = select(ExpenseTransaction).where(
-                ExpenseTransaction.user_id == user_id
-            )
-            if categories:
-                expense_query = expense_query.where(
-                    or_(*[ExpenseTransaction.category == cat for cat in categories])
-                )
-            if since_dt:
-                expense_query = expense_query.where(ExpenseTransaction.date >= since_dt)
-            if until_dt:
-                expense_query = expense_query.where(ExpenseTransaction.date < until_dt)
-            if pattern:
-                expense_query = expense_query.where(
-                    or_(
-                        ExpenseTransaction.merchant.ilike(pattern),
-                        ExpenseTransaction.category.ilike(pattern),
-                    )
-                )
-            expense_rows = (
-                await session.execute(expense_query.order_by(ExpenseTransaction.date.desc()))
-            ).scalars().all()
-            outgoing_items = [
-                {
-                    "direction": "outgoing",
-                    "title": row.merchant,
-                    "amount": float(row.amount),
-                    "currency": row.currency,
-                    "category": row.category,
-                    "date": row.date.isoformat(),
-                }
-                for row in expense_rows
-            ]
-
-        if "incoming" in wanted_directions:
-            income_query = select(IncomeTransaction).where(
-                IncomeTransaction.user_id == user_id
-            )
-            if categories:
-                income_query = income_query.where(
-                    or_(*[IncomeTransaction.category == cat for cat in categories])
-                )
-            if since_dt:
-                income_query = income_query.where(IncomeTransaction.date >= since_dt)
-            if until_dt:
-                income_query = income_query.where(IncomeTransaction.date < until_dt)
-            if pattern:
-                income_query = income_query.where(
-                    or_(
-                        IncomeTransaction.source.ilike(pattern),
-                        IncomeTransaction.category.ilike(pattern),
-                        IncomeTransaction.notes.ilike(pattern),
-                    )
-                )
-            income_rows = (
-                await session.execute(income_query.order_by(IncomeTransaction.date.desc()))
-            ).scalars().all()
-            incoming_items = [
-                {
-                    "direction": "incoming",
-                    "title": row.source,
-                    "amount": float(row.amount),
-                    "currency": row.currency,
-                    "category": row.category,
-                    "date": row.date.isoformat(),
-                }
-                for row in income_rows
-            ]
-
-    def _totals(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        grouped: Dict[str, Dict[str, Any]] = {}
-        for item in items:
-            bucket = grouped.setdefault(item["currency"], {"total": 0.0, "count": 0})
-            bucket["total"] += item["amount"]
-            bucket["count"] += 1
-        return grouped
-
-    items = sorted(outgoing_items + incoming_items, key=lambda row: row["date"], reverse=True)
-    outgoing_totals = _totals(outgoing_items)
-    incoming_totals = _totals(incoming_items)
-    currencies = sorted(set(outgoing_totals) | set(incoming_totals))
-    net = {
-        currency: round(
-            incoming_totals.get(currency, {}).get("total", 0.0)
-            - outgoing_totals.get(currency, {}).get("total", 0.0),
-            2,
+        projection = await query_unified_ledger(
+            session,
+            user_id,
+            direction=direction,
+            categories=categories,
+            since_date=since_dt,
+            until_date=until_dt,
+            search_text=search_text,
+            limit=limit,
         )
-        for currency in currencies
-    }
     return {
-        "direction": direction,
-        "money_out": outgoing_totals,
-        "money_in": incoming_totals,
-        "net": net,
-        "items": items[: max(1, limit)],
-        "total_matched": len(items),
+        "direction": projection.direction,
+        "money_out": {
+            currency: {"total": total.total, "count": total.count}
+            for currency, total in projection.money_out.items()
+        },
+        "money_in": {
+            currency: {"total": total.total, "count": total.count}
+            for currency, total in projection.money_in.items()
+        },
+        "net": dict(projection.net),
+        "items": [
+            {
+                "direction": entry.direction,
+                "title": entry.title,
+                "amount": entry.amount,
+                "currency": entry.currency,
+                "category": entry.category,
+                "date": entry.date.isoformat(),
+            }
+            for entry in projection.items
+        ],
+        "total_matched": projection.total_matched,
     }
 
 
@@ -2337,5 +2260,3 @@ async def split_bill_expense(
         "reply_text": full_reply,
         "buttons": buttons,
     }
-
-

@@ -54,4 +54,4 @@ pythonpath = ["."]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["app*", "core*", "capabilities*", "orchestrator*"]
+include = ["app*", "core*", "capabilities*", "orchestrator*", "domain*"]

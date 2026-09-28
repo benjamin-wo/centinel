@@ -1,0 +1,11 @@
+# Alembic Baseline Verification
+
+Date: 2026-09-28
+
+Command: `uv run pytest tests/test_migration_baseline.py tests/test_schema_safety.py tests/test_schema_comparator.py -q`
+Exit code: 0
+Summary: `22 passed`
+
+The disposable PostgreSQL harness verified the 17-table schema contract,
+Alembic drift detection, checkpointer exclusion, URL safety, and forward-only
+downgrade behavior. No production or Railway database URL was used.

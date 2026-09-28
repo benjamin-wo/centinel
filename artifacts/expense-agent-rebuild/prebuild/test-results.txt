@@ -1,0 +1,13 @@
+# Prebuild Verification Results
+
+Date: 2026-09-28
+
+Command: `uv run pytest tests/ -q`
+Exit code: 0
+Summary: `234 passed, 2 warnings`
+
+Command: `uv run pytest tests/test_models_and_db.py tests/test_email_and_expenses.py -q`
+Exit code: 0
+Summary: `60 passed, 1 warning`
+
+Warnings are dependency deprecations from `google.genai` and FastAPI/httpx test-client integration; no test failed.

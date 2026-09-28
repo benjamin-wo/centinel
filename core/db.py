@@ -3,11 +3,13 @@ import logging
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError, ProgrammingError
+from sqlalchemy.exc import OperationalError, ProgrammingError, SQLAlchemyError
 from sqlmodel import SQLModel
 from core.config import settings
 
 logger = logging.getLogger(__name__)
+
+ALEMBIC_HEAD = "a1b2c3d4e5f4"
 
 def _is_duplicate_column_error(exc: Exception) -> bool:
     """Return True only for 'column already exists' style errors so we don't
@@ -48,6 +50,32 @@ async_session_factory = async_sessionmaker(
     class_=AsyncSession,
     expire_on_commit=False,
 )
+
+
+async def verify_migration() -> None:
+    """Verify that the database has the reviewed Alembic schema head.
+
+    The rebuild service must never create or alter schema during startup. A
+    missing, empty, or stale Alembic version table is an activation error and
+    must be repaired by a controlled migration operation before the service
+    starts serving traffic.
+    """
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(text("SELECT version_num FROM alembic_version"))
+            versions = {str(row[0]) for row in result}
+    except SQLAlchemyError as exc:
+        raise RuntimeError(
+            "Database schema is not initialized; run 'alembic upgrade head' "
+            "against the approved database before starting the rebuild service."
+        ) from exc
+
+    if versions != {ALEMBIC_HEAD}:
+        raise RuntimeError(
+            "Database schema is not at the reviewed Alembic head; run "
+            "'alembic upgrade head' against the approved database before "
+            "starting the rebuild service."
+        )
 
 async def init_db() -> None:
     async with engine.begin() as conn:

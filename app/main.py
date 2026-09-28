@@ -6,7 +6,7 @@ from fastapi.exceptions import HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from core.db import init_db
+from core.db import verify_migration
 from core.scheduler import start_scheduler, shutdown_scheduler
 from orchestrator.checkpointer import setup_checkpointer, close_checkpointer
 from app.webhook import router as webhook_router
@@ -18,13 +18,13 @@ from app.dashboard_api import router as dashboard_router
 async def lifespan(app: FastAPI):
     """
     Uvicorn lifespan manager for Railway deployment:
-    - Initialize database tables
+    - Verify the reviewed Alembic database schema
     - Start APScheduler engine & watchdog
     - Register Telegram bot commands and menu button
     - Gracefully shutdown scheduler on exit
     """
     await setup_checkpointer()
-    await init_db()
+    await verify_migration()
     try:
         from core.db import async_session_factory
         from core.models import ExpenseTransaction
@@ -107,5 +107,4 @@ showcase_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "showcas
 if os.path.exists(showcase_dir):
     app.mount("/showcase", StaticFiles(directory=showcase_dir, html=True), name="showcase")
     app.mount("/", StaticFiles(directory=showcase_dir, html=True), name="static_root")
-
 

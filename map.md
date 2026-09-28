@@ -1,0 +1,41 @@
+# Wayfinder Map: Centinel Expense & Finance Telegram Bot Architecture Spec (RFC)
+
+## Destination
+
+A Complete Technical & Functional Architecture Spec (RFC) detailing the bot's expense/finance agentic architecture, LangGraph agent loop, Railway PostgreSQL storage, multimodal Telegram webhook I/O, and skill-based extensibility, ready for engineering execution.
+
+## Notes
+
+- **Hosting & Scope**: Single-User Architecture with Multi-User Extensibility (`user_id` scoped data models and modular auth/credentials from day one), deployed on Railway.
+- **Orchestration**: Python + LangGraph Agent Loop (`agent_turn` tool-chaining agent with deterministic safety kernel).
+- **Storage & Memory**: Railway Managed PostgreSQL (`PostgresSaver` + SQLModel/SQLAlchemy).
+- **Telegram I/O**: `python-telegram-bot` + Railway Webhook (via FastAPI) + Gemini Flash / Kimi k3 Native Multimodal Support (direct audio/image ingestion).
+- **Skill Architecture**: Skill-based extensibility (`skills/<name>/SKILL.md` with YAML frontmatter) with progressive-disclosure loading and a tool registry.
+- **Proactive Scheduling**: `APScheduler` in-process + Conversational Scheduling (`schedule_proactive_task`) + `/run_now` / Dry-Run Testing Engine + Dynamic IANA Timezone Adaptation.
+
+## Decisions so far
+
+<!-- the index — one line per closed ticket: enough to judge relevance, then zoom the link for the detail the ticket holds -->
+
+- [01 - Core Supervisor & Capability Handoff Protocol](issues/01-core-supervisor-protocol.md) — Subgraph handoff via `Command(goto=...)`, HITL confirmations via `interrupt()` + Telegram Inline Buttons, and persistent `thread_id` sessions with automatic pruning.
+- [02 - Email Capability & Gmail API Integration](issues/02-email-capability-and-gmail-api.md) — Google OAuth 2.0 with zero-friction smart category search + auto-discovery of tracked bank domains, 2-layer deduplication (`-label:Assistant/Processed` and DB unique index), and Pydantic schema with HITL Telegram clarification on low confidence.
+- [03 - Database Schema & Credential Encryption](issues/03-database-schema-and-encryption.md) — Fully user-scoped SQLModel tables (`user_id` foreign keys), symmetric authenticated encryption (`Fernet` / AES-256-GCM via Railway `ENCRYPTION_KEY`), and AsyncSQLModel with `asyncpg` driver and connection pooling.
+- [04 - Multimodal Telegram Webhook & Inline Callback Architecture](issues/04-multimodal-telegram-webhook.md) — In-memory Base64 data-URI content blocks for native multimodal processing without disk I/O, and compact 64-byte JSON callback payload for stateless LangGraph checkpoint resumption.
+- [05 - Proactive Scheduler & Dynamic Timezone Adaptation Protocol](issues/05-proactive-scheduler-and-timezone.md) — Dynamic Postgres-backed `ScheduledJob` table, 5-Pillar Guardrail System (`lifespan` hook, `misfire_grace_time=3600`, `tzdata` ZoneInfo, dual-registration watchdog, `/run_now`), and dynamic IANA timezone adaptation.
+- [06 - Capability Gap Handling Map](issues/06-capability-gap-handling-map.md) — Strategic map for handling unsupported capabilities via hybrid generalist fallbacks, structured intent routing, and demand telemetry.
+- [07 - Research Agentic Capability Gap Patterns](issues/07-research-agentic-capability-gap-patterns.md) — Comparative research on graceful degradation, fallback subagents, and capability gap discovery across agentic systems.
+- [08 - Design Supervisor Fallback & Intent Protocol](issues/08-design-supervisor-fallback-intent-protocol.md) — Structured v2.0 intent classification routing (`informational_fallback`, `unsupported_transaction`, etc.) in the supervisor.
+- [09 - Prototype Generalist Fallback Subagent](issues/09-prototype-generalist-fallback-subagent.md) — Design and prototype of `general_subagent` to provide informational workarounds when a specific capability tool is missing.
+- [10 - Design Capability Demand Telemetry Loop](issues/10-design-capability-demand-telemetry.md) — Persistent database logging of missing capabilities (`CapabilityRequestLog`) and `/missing_capabilities` leaderboard analytics.
+- [11 - Design Hybrid Multimodal (Gemini) & Variable-Thinking (DeepSeek v4 Flash) Architecture](issues/11-design-hybrid-multimodal-deepseek-routing.md) — Architecture for Gemini-powered multimodal I/O and DeepSeek v4 Flash agent reasoning with LOW / MEDIUM / HIGH variable thinking levels.
+
+## Not yet specified
+
+- Detailed implementation of individual capability tools (e.g., specific expense categorization rules, email bank statement parsers).
+- End-to-end integration test suite and CI/CD pipeline on Railway.
+- Future multi-tenant user onboarding flow and Stripe/billing integration.
+
+## Out of scope
+
+- Multi-tenant user login web UI or OAuth callback portal (scope is Telegram-first, single-user with multi-user-ready data models).
+- Custom speech-to-text or OCR training (we use Gemini Flash / Kimi k3 native multimodal input).

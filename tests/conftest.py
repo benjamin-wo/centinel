@@ -7,6 +7,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 import os
 import core.db as db_mod
 import core.models  # noqa: F401 - ensure models are registered with SQLModel.metadata
+from cryptography.fernet import Fernet
+from core.config import settings
 
 TEST_DB_PATH = "./test_testdb.sqlite"
 
@@ -17,6 +19,9 @@ TEST_DB_PATH = "./test_testdb.sqlite"
 # legacy tables, whose '[]'::json and similar PostgreSQL-only defaults would
 # crash on SQLite.
 _APP_TABLES: list[Table] = list(SQLModel.metadata.tables.values())
+
+if settings.encryption_key is None:
+    settings.encryption_key = Fernet.generate_key().decode("utf-8")
 
 def pytest_configure(config):
     config.addinivalue_line(

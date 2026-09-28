@@ -3,21 +3,16 @@ from cryptography.fernet import Fernet
 from core.config import settings
 
 _fernet_instance = None
-_default_test_key = Fernet.generate_key()
-
 def get_fernet_instance() -> Fernet:
     global _fernet_instance
     if _fernet_instance is None:
         key_str = settings.encryption_key
         if not key_str:
-            # Fallback to in-memory key for local development/testing
-            print(
-                "[VAULT] ENCRYPTION_KEY not set — using a per-process random key; "
-                "persisted secrets will not survive restarts!"
+            raise RuntimeError(
+                "ENCRYPTION_KEY must be configured before encrypted credentials "
+                "can be accessed."
             )
-            key_bytes = _default_test_key
-        else:
-            key_bytes = key_str.encode("utf-8")
+        key_bytes = key_str.encode("utf-8")
         _fernet_instance = Fernet(key_bytes)
     return _fernet_instance
 

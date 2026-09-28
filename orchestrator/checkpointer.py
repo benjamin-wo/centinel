@@ -50,7 +50,6 @@ async def setup_checkpointer():
         # bounds every op.
         iterator = AsyncPostgresSaver.from_conn_string(bounded_conn_string, pipeline=False)
         saver = await iterator.__aenter__()
-        await _run_postgres_migrations(conn_string)
         _postgres_iterator = iterator
         _checkpointer = saver
         print("[CHECKPOINTER] PostgresSaver ready — conversation memory is durable.")
@@ -65,6 +64,14 @@ CHECKPOINT_STATEMENT_TIMEOUT_MS = 30_000
 def _with_statement_timeout(conn_string: str, timeout_ms: int) -> str:
     separator = "&" if "?" in conn_string else "?"
     return f"{conn_string}{separator}options=-c%20statement_timeout%3D{timeout_ms}"
+
+
+async def migrate_checkpointer() -> None:
+    """Run the package-owned checkpoint migration as an explicit operation."""
+    if not settings.database_url.startswith("postgresql"):
+        raise RuntimeError("Checkpoint migrations require a PostgreSQL database.")
+    conn_string = settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
+    await _run_postgres_migrations(conn_string)
 
 
 async def reset_checkpointer() -> None:
